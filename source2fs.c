@@ -5,7 +5,7 @@
  * With the permission of Miklos Szeredi, the entirety of this file is exclusively licensed
  * under the GNU GPL, version 2 or later:
  *
- * DFUSE, (C) Dan Reif, Miklos Szeredi, and others, based on the Hello FS template by Miklos
+ * Source2FS, (C) Dan Reif, Miklos Szeredi, and others, based on the Hello FS template by Miklos
  * Szeredi <miklos@szeredi.hu>.  This code and any resultant executables or libraries are
  * governed by the terms of the GPL published by the GNU project of the Free Software
  * Foundation, either version 2, or (at your option) the latest version available at
@@ -39,6 +39,8 @@
 struct options {
     char *fastpath_path;
 }options;
+
+char *paths[3];
 
 FILE *debug_fd( void );
 
@@ -156,89 +158,163 @@ FILE *debug_fd( void )
     return fp;
 }
 
+// If you don't care about stbuf, set it to NULL.
+static char *source2fs_where(const char *path, struct stat *stbuf)
+{
+    char *pathed_file = NULL;
+    struct stat *pathed_stat = NULL;
+    int rv, rv_e, i;
+
+    D( "Running _where on '%s'\n", path );
+
+    // Should be redundant with our caller, but paranoia is cheap and compilers are smart.
+    if( !path || path[0] == '\0' || path[0] != '/' )
+    {
+	DFRV(NULL);
+    }
+
+    for ( i = 0; paths[i]; i++ )
+    {
+	D( " - Sarching %s.\n", paths[i] );
+
+	if ( !( pathed_stat = DFUSE_MALLOC( sizeof(struct stat) ) ) )
+	{
+	    D( "Out of memory at %d", __LINE__ );
+	    // Arguably should die noisily here, but let's stay up if we can and just pretend
+	    // this is ENOENT....
+	    DFRV(NULL);
+	}
+
+	// Clean up our stat struct before we try to use it.
+	memset( pathed_stat, 0, sizeof(struct stat) );
+
+	if ( !( pathed_file = DFUSE_MALLOC( strlen( paths[i] ) + strlen( path ) + 1 ) ) )
+	{
+	    DFUSE_FREE(pathed_stat);
+	    D( "Out of memory at %d", __LINE__ );
+	    // Again, pretend we have ENOENT.
+	    DFRV(NULL);
+	}
+
+	strcpy( pathed_file, paths[i] );
+	strcpy( pathed_file+strlen(paths[i]), path );
+
+	rv = stat( pathed_file, pathed_stat );
+	rv_e = errno;
+
+	if ( rv != 0 && ( rv_e == ENOENT || rv_e == ENOTDIR ) )
+	{
+	    D( " - - No hit - %s.\n", strerror(rv_e));
+	    // Find it in a slower source, or else fail to find it.
+	    DFUSE_FREE(pathed_stat);
+	    DFUSE_FREE(pathed_file);
+	    continue;
+	}
+	else if ( rv != 0 )
+	{
+	    // Something strange--EACCESS, ELOOP, etc.; see stat(2).  At any rate, return now, along
+	    // with the stat on the off chance it has anything relevant.  (This last bit might be a
+	    // memory leak depending on how we or FUSE handles the error state.)
+	    if ( stbuf )
+	    {
+		memcpy( stbuf, pathed_stat, sizeof( struct stat ) );
+	    }
+
+	    D( " - - Strange errno of %s encountered.  Bailing.\n", strerror(rv_e) );
+
+	    DFUSE_FREE(pathed_stat);
+	    DFUSE_FREE(pathed_file);
+	    DFRV(NULL);
+	}
+
+	// We've got a hit!  (Or something similar, anyway.)  Let our caller know.
+	if ( stbuf )
+	{
+	    memcpy( stbuf, pathed_stat, sizeof( struct stat ) );
+	}
+
+	D( " - - Hit found!  Returning %s.\n", pathed_file );
+
+	DFUSE_FREE(pathed_stat);
+	DFRV( pathed_file );
+    }
+
+    // "What about you guys?"  "We ain't found shit."
+    D( " - Exiting; no joy.%s\n", "" );
+    DFRV( NULL );
+}
+
 static int dfuse_readlink(const char *path, char *linkbuf, size_t bufsize )
 {
+    char * hit_path;
+
     if ( bufsize <= 0 )
     {
-	DFRV(-EINVAL);
+	DFRV(-EINVAL); //EFAULT?  ENAMETOOLONG?  Who knows.  Probably not our problem.
+    }
+
+    if ( !( hit_path = source2fs_where( path, NULL ) ) )
+    {
+	DFRV(-EINVAL); //From readlink(2): "The named file is not a symbolic link."
+    }
+
+    if ( strlen(hit_path) == 0 ) // Whaa?
+    {
+	DFRV(-EINVAL); //Uh... thar be dragons?  I have no idea how or why we would hit this.
     }
 
     //libc function says strlen("blah"), but FUSE API docs say +1.
-    if ( bufsize < strlen(options.fastpath_path) + strlen(path) + 1 )
+    if ( bufsize < strlen(hit_path) )
     {
 	DFRV(-ENOMEM);
     }
 
-    strncpy(linkbuf,options.fastpath_path,bufsize);
-    strncpy(linkbuf+strlen(options.fastpath_path),path,bufsize-strlen(linkbuf));
+    strncpy(linkbuf,hit_path,bufsize);
 
     DFRV(0);
 }
 
 static int dfuse_getattr(const char *path, struct stat *stbuf)
 {
-    int rv;
-    char *fastpath_file;
-    struct stat *fastpath_stat = NULL;
+    char *hit_path;
 
-    if( !path || path[0] == '\0' || path[0] != '/' )
+    if ( ( hit_path = source2fs_where( path, stbuf ) ) )
     {
-	DFRV(-ENOENT);
-    }
+	// If we've got a directory, we're done; directories are special beasts, because we return
+	// them as--gasp!--actual directories, instead of keeping up the symlink pretense.
+	if ( stbuf->st_mode & S_IFDIR )
+	{
+	    // stbuf->st_mode = S_IFDIR | 0755;
+	    // stbuf->st_nlink = 2;
 
-    if ( !( fastpath_stat = DFUSE_MALLOC( sizeof( struct stat ) ) ) )
-    {
-	DFRV(-ENOMEM);
-    }
+	    //D("%s is a directory\n", pathed_file);
+	    //D("%s is the path\n", path);
+	    //D("%x is the stat\n", pathed_stat->st_mode);
 
-    memset(fastpath_stat, 0, sizeof(struct stat));
+	    // We don't use it, but we have to clean it up.
+	    DFUSE_FREE(hit_path);
 
-    if ( !( fastpath_file = DFUSE_MALLOC( strlen( options.fastpath_path ) + strlen( path ) + 1 ) ) )
-    {
-	DFUSE_FREE(fastpath_stat);
-	DFRV(-ENOMEM);
-    }
+	    DFRV( 0 );
+	}
 
-    strcpy( fastpath_file, options.fastpath_path );
-    strcpy( fastpath_file+strlen(options.fastpath_path), path );
+	// Okay, we've got a file (or something roughly approximating a file; a symlink, even to a
+	// directory, is actually perfectly sufficient here).  Let's pretend it's a symlink in our
+	// FUSE'd fs.
+	memset( stbuf, 0, sizeof(struct stat) );
 
-    rv = stat( fastpath_file, fastpath_stat );
+	stbuf->st_nlink = 1;
+	stbuf->st_mode |= S_IFLNK | 0777;
 
-    if ( rv == ENOENT || rv == ENOTDIR )
-    {
-	// Find it in a slower source, or else fail to find it.
-	DFRV( -ENOENT );
-    }
-    else if ( rv != 0 )
-    {
-	DFUSE_FREE(fastpath_stat);
-	DFUSE_FREE(fastpath_file);
-	DFRV(-rv);
-    }
-
-    if ( fastpath_stat->st_mode & S_IFDIR )
-    {
-//	stbuf->st_mode = S_IFDIR | 0755;
-//	stbuf->st_nlink = 2;
-
-	D("%s is a directory\n", fastpath_file);
-	D("%s is the path\n", path);
-	D("%x is the stat\n", fastpath_stat->st_mode);
-
-	memcpy( stbuf, fastpath_stat, sizeof( struct stat ) );
-
-	DFUSE_FREE(fastpath_stat);
-	DFUSE_FREE(fastpath_file);
+	// Could do it this way...
+	// stbuf->st_size = strlen( paths[i] ) + strlen( path );
+	// But this seems easier:
+	stbuf->st_size = strlen(hit_path);
+	DFUSE_FREE(hit_path);
 	DFRV( 0 );
     }
 
-    stbuf->st_nlink = 1;
-    stbuf->st_mode |= S_IFLNK | 0777;
-    stbuf->st_size = strlen( options.fastpath_path ) + strlen( path );
-
-    DFUSE_FREE(fastpath_stat);
-    DFUSE_FREE(fastpath_file);
-    DFRV( 0 );
+    // No such number, no such soul.
+    DFRV( -ENOENT );
 }
 
 //dirent_buf_size courtesy of http://womble.decadent.org.uk/readdir_r-advisory.html
@@ -279,11 +355,16 @@ size_t dirent_buf_size(DIR * dirp)
             ? name_end : sizeof(struct dirent));
 }
 
-
+/*
+ * Conscious design decision: de-duping is both hard and expensive.  Any attempt to
+ * actually write to something that already exists will run into appropriate barriers
+ * (or not) as appropriate.  Therefore, "ls" only shows stuff in the first paths[].
+ * This may have unforeseen consequences, though.  Kindly let me know if so.
+ */
 static int dfuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 			 off_t offset, struct fuse_file_info *fi)
 {
-    long fastpath_path_length = strlen( options.fastpath_path );
+    long fastpath_path_length = strlen( paths[0] );
     DIR * dirp;
     struct dirent *entry;
     struct dirent *result;
@@ -301,7 +382,7 @@ static int dfuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	DFRV(-ENOMEM);
     }
 
-    strcpy(fastpath_file,options.fastpath_path);
+    strcpy(fastpath_file,paths[0]);
     strcpy(fastpath_file+fastpath_path_length,path);
 
     // If the target doesn't exist on the fastpath, check on the slowpath(s); if still no
@@ -389,6 +470,11 @@ int main(int argc, char *argv[])
 {
     int rv = -1;
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+
+//    paths = malloc( sizeof( char * ) * 3 );
+    paths[0] = "/tmp/foo";
+    paths[1] = "/tmp/bar";
+    paths[2] = NULL;
 
 //    printf( "Starting...\n" );
 
