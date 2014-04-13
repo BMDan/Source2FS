@@ -175,7 +175,7 @@ static char *source2fs_where(const char *path, struct stat *stbuf)
 
     for ( i = 0; paths[i]; i++ )
     {
-	D( " - Sarching %s.\n", paths[i] );
+	D( " - Searching %s.\n", paths[i] );
 
 	if ( !( pathed_stat = DFUSE_MALLOC( sizeof(struct stat) ) ) )
 	{
